@@ -63,6 +63,8 @@ static void ash_post_parse_analyze(ParseState *pstate, Query *query);
 /* GUC variables */
 static int ash_sampling_period = 1;
 static int ash_max_entries = 1000;
+static int ash_restart_period = 10;
+static int ash_restart_wait_time = 10;
 char *pgsentinelDbName = "postgres";
 
 /* to create queryid in case of utility statements*/
@@ -126,6 +128,12 @@ typedef struct procEntry
 	int qlen;
 } procEntry;
 
+/* Int entry */
+typedef struct intEntry
+{
+  int inserted;
+} intEntry;
+
 /* For shared memory */
 static char *AshEntryUsenameBuffer = NULL;
 static char *AshEntryDatnameBuffer = NULL;
@@ -142,6 +150,7 @@ static char *AshEntryBlockerStateBuffer = NULL;
 static char *AshEntryClientaddrBuffer = NULL;
 static ashEntry *AshEntryArray = NULL;
 static procEntry *ProcEntryArray = NULL;
+static intEntry *IntEntryArray = NULL;
 static char *ProcQueryBuffer = NULL;
 static char *ProcCmdTypeBuffer = NULL;
 
@@ -154,10 +163,7 @@ static Size proc_entry_memsize(void);
 static procEntry search_procentry(int backendPid);
 
 /* store ash entry */
-static void ash_entry_store(TimestampTz ash_time, int inserted,const int pid,const char *usename, const int client_port,Oid datid, const char *datname, const char *application_name, const char *client_addr, TransactionId backend_xmin, TimestampTz backend_start, TimestampTz xact_start, TimestampTz query_start, TimestampTz state_change, const char *wait_event_type, const char *wait_event, const char *state, const char *client_hostname, const char *query, const char *backend_type, Oid usesysid, TransactionId backend_xid, int blockers, int blockerpid, const char *blocker_state);
-
-/* to rotate the ash entries */
-static int inserted=0;
+static void ash_entry_store(TimestampTz ash_time,const int pid,const char *usename, const int client_port,Oid datid, const char *datname, const char *application_name, const char *client_addr, TransactionId backend_xmin, TimestampTz backend_start, TimestampTz xact_start, TimestampTz query_start, TimestampTz state_change, const char *wait_event_type, const char *wait_event, const char *state, const char *client_hostname, const char *query, const char *backend_type, Oid usesysid, TransactionId backend_xid, int blockers, int blockerpid, const char *blocker_state);
 
 /* prepare store ash */
 static void ash_prepare_store(TimestampTz ash_time,const int pid, const char* usename,const int client_port, Oid datid, const char *datname, const char *application_name, const char *client_addr, TransactionId backend_xmin, TimestampTz backend_start, TimestampTz xact_start, TimestampTz query_start, TimestampTz state_change, const char *wait_event_type, const char *wait_event, const char *state, const char *client_hostname, const char *query, const char *backend_type, Oid usesysid, TransactionId backend_xid, int blockers, int blockerpid, const char *blocker_state);
@@ -361,6 +367,16 @@ proc_entry_memsize(void)
 	return size;
 }
 
+/* Estimate amount of shared memory needed for int entry*/
+static Size
+int_entry_memsize(void)
+{
+        Size            size;
+        /* IntEntryArray */
+	size = mul_size(sizeof(intEntry), 1);
+        return size;
+}
+
 
 static void
 ash_shmem_startup(void)
@@ -380,7 +396,17 @@ ash_shmem_startup(void)
 	if (!found)
 	{
 		MemSet(AshEntryArray, 0, size);
+	} 
+
+	size = mul_size(sizeof(intEntry), 1);
+	IntEntryArray = (intEntry *) ShmemInitStruct("int Entry Array", size, &found);
+
+	if (!found)
+	{
+		MemSet(IntEntryArray, 0, size);
+	        IntEntryArray[0].inserted=0;
 	}
+
 
 	size = mul_size(sizeof(procEntry), get_max_procs_count());
 	ProcEntryArray = (procEntry *) ShmemInitStruct("Proc Entry Array", size, &found);
@@ -705,10 +731,12 @@ pgsentinel_sighup(SIGNAL_ARGS)
 }
 
 static void
-ash_entry_store(TimestampTz ash_time, int inserted,const int pid,const char *usename,const int client_port, Oid datid, const char *datname, const char *application_name, const char *client_addr, TransactionId backend_xmin, TimestampTz backend_start, TimestampTz xact_start, TimestampTz query_start, TimestampTz state_change, const char *wait_event_type, const char *wait_event, const char *state, const char *client_hostname, const char *query, const char *backend_type, Oid usesysid, TransactionId backend_xid, int blockers, int blockerpid, const char *blocker_state)
+ash_entry_store(TimestampTz ash_time,const int pid,const char *usename,const int client_port, Oid datid, const char *datname, const char *application_name, const char *client_addr, TransactionId backend_xmin, TimestampTz backend_start, TimestampTz xact_start, TimestampTz query_start, TimestampTz state_change, const char *wait_event_type, const char *wait_event, const char *state, const char *client_hostname, const char *query, const char *backend_type, Oid usesysid, TransactionId backend_xid, int blockers, int blockerpid, const char *blocker_state)
 {
 	procEntry newprocentry;
 	int len;
+	int inserted;
+	inserted=IntEntryArray[0].inserted-1;
 	newprocentry = search_procentry(pid);
 	memcpy(AshEntryArray[inserted].usename,usename,Min(strlen(usename)+1,NAMEDATALEN-1));
 	memcpy(AshEntryArray[inserted].datname,datname,Min(strlen(datname)+1,NAMEDATALEN-1));
@@ -749,13 +777,16 @@ ash_prepare_store(TimestampTz ash_time, const int pid, const char* usename,const
 	/* Safety check... */
 	if (!AshEntryArray) { return; }
 
-	inserted = (inserted % ash_max_entries) + 1;
-	ash_entry_store(ash_time,inserted - 1,pid,usename,client_port,datid, datname, application_name, client_addr,backend_xmin, backend_start, xact_start, query_start, state_change, wait_event_type, wait_event, state, client_hostname, query, backend_type,usesysid,backend_xid, blockers, blockerpid, blocker_state);
+	IntEntryArray[0].inserted=(IntEntryArray[0].inserted % ash_max_entries) + 1;;
+	ash_entry_store(ash_time,pid,usename,client_port,datid, datname, application_name, client_addr,backend_xmin, backend_start, xact_start, query_start, state_change, wait_event_type, wait_event, state, client_hostname, query, backend_type,usesysid,backend_xid, blockers, blockerpid, blocker_state);
 }
 
 void
 pgsentinel_main(Datum main_arg)
 {
+
+	int j=0;
+        ereport(LOG, (errmsg("starting bgworker pgsentinel")));
 
 	/* Register functions for SIGTERM/SIGHUP management */
 	pqsignal(SIGHUP, pgsentinel_sighup);
@@ -773,9 +804,11 @@ pgsentinel_main(Datum main_arg)
 
 	while (!got_sigterm)
 	{
-
 		int rc, ret, i;
 		MemoryContext uppercxt;
+       		if (j * ash_sampling_period > ash_restart_period) 
+	 	    proc_exit(1);
+		j+=1;
 
 		/* Wait necessary amount of time */
 #if PG_VERSION_NUM >= 100000
@@ -1003,12 +1036,38 @@ pgsentinel_load_params(void)
 							NULL,
 							NULL);
 
+	DefineCustomIntVariable("pgsentinel_ash.restart_period",
+							"Duration before restart (in seconds).",
+							NULL,
+							&ash_restart_period,
+							1,
+							1,
+							INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pgsentinel_ash.restart_wait_time",
+							"time to wait once stopped before restart (in seconds).",
+							NULL,
+							&ash_restart_wait_time,
+							1,
+							1,
+							INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
 	DefineCustomIntVariable("pgsentinel_ash.max_entries",
 							"Maximum number of ash entries.",
 							NULL,
 							&ash_max_entries,
-							1000,
-							1000,
+							1,
+							1,
 							INT_MAX,
 							PGC_SIGHUP,
 							0,
@@ -1049,6 +1108,9 @@ _PG_init(void)
 	RequestAddinShmemSpace(proc_entry_memsize());
 	RequestNamedLWLockTranche("Proc Entry Array", 1);
 
+	EmitWarningsOnPlaceholders("Int Entry Array");
+	RequestAddinShmemSpace(int_entry_memsize());
+	RequestNamedLWLockTranche("Int Entry Array", 1);
 
 	/*
 	 * Install hooks.
@@ -1070,8 +1132,8 @@ _PG_init(void)
 	worker.bgw_main = pgsentinel_main;
 #endif
 	snprintf(worker.bgw_name, BGW_MAXLEN, "%s", worker_name);
-	/* Wait 10 seconds for restart before crash */
-	worker.bgw_restart_time = 10;
+	/* Wait ash_restart_wait_time seconds for restart before crash */
+	worker.bgw_restart_time = ash_restart_wait_time;
 	worker.bgw_main_arg = (Datum) 0;
 #if PG_VERSION_NUM >= 90400
 	/*
